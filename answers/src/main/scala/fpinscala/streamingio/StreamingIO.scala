@@ -508,7 +508,7 @@ object GeneralizedStreamTransducers {
 
                              */
 
-  trait Process[F[_],O] {
+  sealed trait Process[F[_],O] {
     import Process._
 
     /*
@@ -517,8 +517,8 @@ object GeneralizedStreamTransducers {
      */
 
     def map[O2](f: O => O2): Process[F,O2] = this match {
-      case Await(req,recv) =>
-        Await(req, recv andThen (_ map f))
+      case a@Await() =>
+        Await(a.req, a.recv andThen (_ map f))
       case Emit(h, t) => Try { Emit(f(h), t map f) }
       case Halt(err) => Halt(err)
     }
@@ -541,16 +541,16 @@ object GeneralizedStreamTransducers {
     def asFinalizer: Process[F,O] = this match {
       case Emit(h, t) => Emit(h, t.asFinalizer)
       case Halt(e) => Halt(e)
-      case Await(req,recv) => await(req) {
+      case a@Await() => await(a.req) {
         case Left(Kill) => this.asFinalizer
-        case x => recv(x)
+        case x => a.recv(x)
       }
     }
 
     def onHalt(f: Throwable => Process[F,O]): Process[F,O] = this match {
       case Halt(e) => Try(f(e))
       case Emit(h, t) => Emit(h, t.onHalt(f))
-      case Await(req,recv) => Await(req, recv andThen (_.onHalt(f)))
+      case a@Await() => Await(a.req, a.recv andThen (_.onHalt(f)))
     }
 
     /*
@@ -561,8 +561,8 @@ object GeneralizedStreamTransducers {
       this match {
         case Halt(err) => Halt(err)
         case Emit(o, t) => Try(f(o)) ++ t.flatMap(f)
-        case Await(req,recv) =>
-          Await(req, recv andThen (_ flatMap f))
+        case a@Await() =>
+          Await(a.req, a.recv andThen (_ flatMap f))
       }
 
     def repeat: Process[F,O] =
@@ -594,7 +594,8 @@ object GeneralizedStreamTransducers {
           case Emit(h,t) => go(t, acc :+ h)
           case Halt(End) => F.unit(acc)
           case Halt(err) => F.fail(err)
-          case Await(req,recv) => F.flatMap (F.attempt(req)) { e => go(Try(recv(e)), acc) }
+          case a@Await() =>
+            F.flatMap (F.attempt(a.req)) { e => go(Try(a.recv(e)), acc) }
         }
       go(this, IndexedSeq())
     }
@@ -615,17 +616,17 @@ object GeneralizedStreamTransducers {
       p2 match {
         case Halt(e) => this.kill onHalt { e2 => Halt(e) ++ Halt(e2) }
         case Emit(h, t) => Emit(h, this |> t)
-        case Await(req,recv) => this match {
-          case Halt(err) => Halt(err) |> recv(Left(err))
-          case Emit(h,t) => t |> Try(recv(Right(h)))
-          case Await(req0,recv0) => await(req0)(recv0 andThen (_ |> p2))
+        case a1@Await() => this match {
+          case Halt(err) => Halt(err) |> a1.recv(Left(err))
+          case Emit(h,t) => t |> Try(a1.recv(Right(h)))
+          case a2@Await() => await(a2.req)(a2.recv andThen (_ |> p2))
         }
       }
     }
 
     @annotation.tailrec
     final def kill[O2]: Process[F,O2] = this match {
-      case Await(req,recv) => recv(Left(Kill)).drain.onHalt {
+      case a@Await() => a.recv(Left(Kill)).drain.onHalt {
         case Kill => Halt(End) // we convert the `Kill` exception back to normal termination
         case e => Halt(e)
       }
@@ -640,7 +641,7 @@ object GeneralizedStreamTransducers {
     final def drain[O2]: Process[F,O2] = this match {
       case Halt(e) => Halt(e)
       case Emit(h, t) => t.drain
-      case Await(req,recv) => Await(req, recv andThen (_.drain))
+      case a@Await() => Await(a.req, a.recv andThen (_.drain))
     }
 
     def filter(f: O => Boolean): Process[F,O] =
@@ -667,18 +668,18 @@ object GeneralizedStreamTransducers {
       t match {
         case Halt(e) => this.kill onComplete p2.kill onComplete Halt(e)
         case Emit(h,t) => Emit(h, (this tee p2)(t))
-        case Await(side, recv) => side.get match {
+        case a@Await() => a.req.get match {
           case Left(isO) => this match {
             case Halt(e) => p2.kill onComplete Halt(e)
-            case Emit(o,ot) => (ot tee p2)(Try(recv(Right(o))))
-            case Await(reqL, recvL) =>
-              await(reqL)(recvL andThen (this2 => this2.tee(p2)(t)))
+            case Emit(o,ot) => (ot tee p2)(Try(a.recv(Right(o))))
+            case l @ Await() =>
+              await(l.req)(l.recv andThen (this2 => this2.tee(p2)(t)))
           }
           case Right(isO2) => p2 match {
             case Halt(e) => this.kill onComplete Halt(e)
-            case Emit(o2,ot) => (this tee ot)(Try(recv(Right(o2))))
-            case Await(reqR, recvR) =>
-              await(reqR)(recvR andThen (p3 => this.tee(p3)(t)))
+            case Emit(o2,ot) => (this tee ot)(Try(a.recv(Right(o2))))
+            case r @ Await() =>
+              await(r.req)(r.recv andThen (p3 => this.tee(p3)(t)))
           }
         }
       }
@@ -698,9 +699,20 @@ object GeneralizedStreamTransducers {
   }
 
   object Process {
-    case class Await[F[_],A,O](
-      req: F[A],
-      recv: Either[Throwable,A] => Process[F,O]) extends Process[F,O]
+    sealed abstract case class Await[F[_], O] private() extends Process[F,O]{
+      type A
+      val req: F[A]
+      val recv: Either[Throwable,A] => Process[F,O]
+    }
+
+    object Await {
+      def apply[F[_], A0, O](req0: F[A0], recv0: Either[Throwable, A0] => Process[F, O]): Process[F, O] =
+        new Await[F, O] {
+          type A = A0
+          val req = req0
+          val recv = recv0
+        }
+    }
 
     case class Emit[F[_],O](
       head: O,
@@ -772,10 +784,10 @@ object GeneralizedStreamTransducers {
           case Emit(h,t) => go(t, acc :+ h)
           case Halt(End) => acc
           case Halt(err) => throw err
-          case Await(req,recv) =>
+          case a @ Await() =>
             val next =
-              try recv(Right(fpinscala.iomonad.unsafePerformIO(req)(E)))
-              catch { case err: Throwable => recv(Left(err)) }
+              try a.recv(Right(fpinscala.iomonad.unsafePerformIO(a.req)(E)))
+              catch { case err: Throwable => a.recv(Left(err)) }
             go(next, acc)
         }
       try go(src, IndexedSeq())
