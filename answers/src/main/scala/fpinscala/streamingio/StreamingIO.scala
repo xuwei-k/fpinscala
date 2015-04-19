@@ -136,9 +136,11 @@ object GeneralizedStreamTransducers {
      */
     def |>[O2](p2: Process1[O,O2]): Process[F,O2] = {
       p2 match {
-        case Halt(e) => this.kill onHalt { e2 => Halt(e) ++ Halt(e2) }
-        case Emit(h, t) => Emit(h, this |> t)
-        case a1@Await() => this match {
+        case p: Halt[({type l[_] = Unit})#l,O2] =>
+          this.kill onHalt { e2 => Halt(p.err) ++ Halt(e2) }
+        case p: Emit[({type l[_] = Unit})#l, O2] =>
+          Emit(p.head, this |> p.tail)
+        case a1: Await[({type l[_] = Unit})#l, O2] => this match {
           case Halt(err) => Halt(err) |> a1.recv(Left(err))
           case Emit(h,t) => t |> Try(a1.recv(Right(h)))
           case a2@Await() => await(a2.req)(a2.recv andThen (_ |> p2))
@@ -186,6 +188,7 @@ object GeneralizedStreamTransducers {
      * which feed the `Tee` in a tail-recursive loop as long as
      * it is awaiting input.
      */
+    /*
     def tee[O2,O3](p2: Process[F,O2])(t: Tee[O,O2,O3]): Process[F,O3] = {
       t match {
         case Halt(e) => this.kill onComplete p2.kill onComplete Halt(e)
@@ -218,6 +221,7 @@ object GeneralizedStreamTransducers {
 
     def through[O2](p2: Channel[F, O, O2]): Process[F,O2] =
       join { (this zipWith p2)((o,f) => f(o)) }
+      */
   }
 
   object Process {
@@ -257,6 +261,9 @@ object GeneralizedStreamTransducers {
     def Try[F[_],O](p: => Process[F,O]): Process[F,O] =
       try p
       catch { case e: Throwable => Halt(e) }
+
+    def Try1[I, O](p: => Process1[I,O]): Process1[I,O] =
+      Try[({type l[_] = Unit})#l, O](p)
 
     /*
      * Safely produce `p`, or run `cleanup` and halt gracefully with the
@@ -393,64 +400,58 @@ object GeneralizedStreamTransducers {
      * earlier, which we'll now call `Process1`.
      */
 
-    case class Is[I]() {
-      sealed trait f[X]
-      val Get = new f[I] {}
-    }
-    def Get[I] = Is[I]().Get
-
-    type Process1[I,O] = Process[Is[I]#f, O]
+    type Process1[I,O] = Process[({type l[_] = Unit})#l, O]
 
     /* Some helper functions to improve type inference. */
 
     def await1[I,O](
         recv: I => Process1[I,O],
         fallback: => Process1[I,O] = halt1[I,O]): Process1[I, O] =
-      Await(Get[I], (e: Either[Throwable,I]) => e match {
+      Await[({type l[_] = Unit})#l, I, O]((), {
         case Left(End) => fallback
-        case Left(err) => Halt(err)
-        case Right(i) => Try(recv(i))
+        case Left(err) => Halt[({type l[_] = Unit})#l, O](err)
+        case Right(i) => Try1(recv(i))
       })
 
     def emit1[I,O](h: O, tl: Process1[I,O] = halt1[I,O]): Process1[I,O] =
-      emit(h, tl)
+      emit[({type l[_] = Unit})#l, O](h, tl)
 
-    def halt1[I,O]: Process1[I,O] = Halt[Is[I]#f, O](End)
+    def halt1[I,O]: Process1[I,O] = Halt[({type l[_] = Unit})#l, O](End)
 
     def lift[I,O](f: I => O): Process1[I,O] =
-      await1[I,O]((i:I) => emit(f(i))) repeat
+      await1[I,O]((i:I) => emit1(f(i))) repeat
 
     def filter[I](f: I => Boolean): Process1[I,I] =
-      await1[I,I](i => if (f(i)) emit(i) else halt1) repeat
+      await1[I,I](i => if (f(i)) emit1(i) else halt1) repeat
 
     // we can define take, takeWhile, and so on as before
 
     def take[I](n: Int): Process1[I,I] =
       if (n <= 0) halt1
-      else await1[I,I](i => emit(i, take(n-1)))
+      else await1[I,I](i => emit1(i, take(n-1)))
 
     def takeWhile[I](f: I => Boolean): Process1[I,I] =
       await1(i =>
-        if (f(i)) emit(i, takeWhile(f))
+        if (f(i)) emit1(i, takeWhile(f))
         else      halt1)
 
     def dropWhile[I](f: I => Boolean): Process1[I,I] =
       await1(i =>
         if (f(i)) dropWhile(f)
-        else      emit(i,id))
+        else      emit1(i,id))
 
     def id[I]: Process1[I,I] =
-      await1((i: I) => emit(i, id))
+      await1((i: I) => emit1(i, id))
 
     def window2[I]: Process1[I,(Option[I],I)] = {
       def go(prev: Option[I]): Process1[I,(Option[I],I)] =
-        await1[I,(Option[I],I)](i => emit(prev -> i) ++ go(Some(i)))
+        await1[I,(Option[I],I)](i => emit1(prev -> i) ++ go(Some(i)))
       go(None)
     }
 
     /** Emits `sep` in between each input received. */
     def intersperse[I](sep: I): Process1[I,I] =
-      await1[I,I](i => emit1(i) ++ id.flatMap(i => emit1(sep) ++ emit1(i)))
+      await1[I,I](i => emit1(i) ++ id[I].flatMap(i => emit1(sep) ++ emit1(i)))
 
                             /*
 
@@ -465,6 +466,7 @@ object GeneralizedStreamTransducers {
 
                              */
 
+    /*
     case class T[I,I2]() {
       sealed trait f[X] { def get: Either[I => X, I2 => X] }
       val L = new f[I] { def get = Left(identity) }
@@ -644,6 +646,7 @@ object GeneralizedStreamTransducers {
            map(_ toString).
            to(fileW(file + ".celsius"))
     } yield ()) drain
+    */
   }
 }
 
@@ -659,6 +662,6 @@ object ProcessTest extends App {
   }
 
   println { Process.runLog { p2.onComplete(p2).onComplete(p2).take(1).take(1) } }
-  println { Process.runLog(converter) }
+  //println { Process.runLog(converter) }
   // println { Process.collect(Process.convertAll) }
 }
