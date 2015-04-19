@@ -140,7 +140,7 @@ object GeneralizedStreamTransducers {
         case Emit(h, t) => Emit(h, this |> t)
         case a1@Await() => this match {
           case Halt(err) => Halt(err) |> a1.recv(Left(err))
-          case Emit(h,t) => t |> Try(a1.recv(Right(h)))
+          case Emit(h,t) => t |> Try(a1.recv1[O].apply(Right(h)))
           case a2@Await() => await(a2.req)(a2.recv andThen (_ |> p2))
         }
       }
@@ -193,13 +193,13 @@ object GeneralizedStreamTransducers {
         case a@Await() => a.req.get match {
           case Left(isO) => this match {
             case Halt(e) => p2.kill onComplete Halt(e)
-            case Emit(o,ot) => (ot tee p2)(Try(a.recv(Right(o))))
+            case Emit(o,ot) => (ot tee p2)(Try(a.recvL.apply(Right(o))))
             case l @ Await() =>
               await(l.req)(l.recv andThen (this2 => this2.tee(p2)(t)))
           }
           case Right(isO2) => p2 match {
             case Halt(e) => this.kill onComplete Halt(e)
-            case Emit(o2,ot) => (this tee ot)(Try(a.recv(Right(o2))))
+            case Emit(o2,ot) => (this tee ot)(Try(a.recvR.apply(Right(o2))))
             case r @ Await() =>
               await(r.req)(r.recv andThen (p3 => this.tee(p3)(t)))
           }
@@ -224,7 +224,15 @@ object GeneralizedStreamTransducers {
     sealed abstract case class Await[F[_], O] private() extends Process[F,O]{
       type A
       val req: F[A]
-      val recv: Either[Throwable,A] => Process[F,O]
+      val recv: Either[Throwable, A] => Process[F,O]
+      def recv1[I](implicit e: this.type <:< Await[Is[I]#f, O]): Either[Throwable, I] => Process[F,O] =
+        recv.asInstanceOf[Either[Throwable, I] => Process[F, O]]
+
+      def recvL[L, R](implicit e: this.type <:< Await[T[L, R]#f, O]): Either[Throwable, L] => Process[F,O] =
+        recv.asInstanceOf[Either[Throwable, L] => Process[F, O]]
+
+      def recvR[L, R](implicit e: this.type <:< Await[T[L, R]#f, O]): Either[Throwable, R] => Process[F,O] =
+        recv.asInstanceOf[Either[Throwable, R] => Process[F, O]]
     }
 
     object Await {
